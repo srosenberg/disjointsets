@@ -1,0 +1,3 @@
+--INSTALL Latex
+
+--RUN 'make'

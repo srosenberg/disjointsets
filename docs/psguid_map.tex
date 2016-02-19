@@ -1,0 +1,481 @@
+\documentclass{article}[12pt]
+
+\usepackage{amsmath}
+\usepackage{amssymb, amsbsy, amsfonts}
+
+\usepackage{url}
+\usepackage{hyperref}
+
+% define a boxed-figure float
+\usepackage{float}
+\floatstyle{boxed}
+\restylefloat{figure}
+
+% for handling pdf graphics
+\usepackage{graphicx}
+
+% for enumeration lists with customizable numbering schemes
+\usepackage{enumerate}
+
+% for code listings
+\usepackage{listings}
+
+% makes code listings look pretty
+\lstset{columns=fullflexible, basicstyle=\small\sffamily, tabsize=2}
+
+\numberwithin{figure}{section}
+
+% environments
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{definition}{Definition}[section]
+\newtheorem{lemma}{Lemma}[section]
+\newtheorem{example}{Example}[section]
+
+\input{macros}
+
+\title{DRAFT: Building {\PSGUID} Map.}
+
+\newcommand{\sr}[1]{(\emph{\small SR:\ #1})\marginpar{$\checkmark$}}
+
+\begin{document}
+
+\maketitle
+
+\pagenumbering{arabic}
+
+\begin{abstract}
+User activity tracking is at the core of our business.  Owing to Web Event Collection framework (WEC), our system
+receives detailed information about user online activity, e.g., clicking, searching, placing order, etc.  
+While some activities such as placing an order require that a user be identified or authenticated, other activities such as clicking or searching
+do not require identification. 
+Thus, once a user is identified we need to merge current activity with prior activity, i.e., activity which precedes
+identification.  Prior activity is of great value.  Intuitively, such activity is indicative of a user's proclivity.
+
+Our current approach assigns to each user a Globally Unique Identifier (GUID) which we shall call {\PSGUID}.  {\PSGUID}s are stored in third-party cookies
+inside a user agent, i.e., browser.  WEC events tag each user activity with a {\PSGUID}\footnote{Currently, three different fields in WEC
+may contain {\PSGUID}s: {\PSRW}, {\PSRJ}, {\PSGUID}.}.
+In addition, WEC events may contain user identifiying information, e.g., email address, user id.  In order to consolidate all WEC events attributed to the same user, we compute sets of all related {\PSGUID}s.
+Intuitively, {\PSGUID}s are related if they are tracking the same user.
+Subsequently, we build the map {\PSGUIDMAP} which maps each {\PSGUID} to its corresponding consumer {\TID}\footnote{{\TID} is short
+for \emph{table identifier}.  Consumer {\TID}s are essentially user identifiers.  Internally, emails and user ids are mapped into {\TID}s.}.
+The invariant is that all related {\PSGUID}s must map to the same {\TID}.
+Downstream processes use the map for event attribution; i.e., if two events contain related {\PSGUID}s, then both events belong to the same user
+in virtue of having the same {\TID}.
+
+\end{abstract}
+
+\section{Introduction}
+
+Our internal jobs such as the \emph{scoring engine}
+use {\TID}s to identify each consumer.  (Using database terminology, {\PSGUID}s can be seen as surrogate keys, whereas {\TID}s are natural keys.)
+Consequently, before user activity can be scored we must associate it with a unique {\TID}.  This association is captured by the {\PSGUID} map.
+The construction of {\PSGUID} map is accomplished by a {\MAPREDUCE} job implemented in \texttt{PSguidMapBuilder.java}.
+The main workflow consists of the following stages: \emph{preprocessing, computing connected components, postprocessing}.
+
+In preprocessing, we are given WEC records---these come in form of sequence files whose values are tab-delimited (keys are ignored).
+If there exists {\PSGUID} map, e.g., from previous run, then it serves as input to the preprocessing stage.
+Essentially, preprocessing determines which {\PSGUID}s and {\TID}s are \emph{immediately} related.  This relation is distributed amongst the sets of nodes
+which form the output of the preprocessing stage.  (See Sect.~\ref{sect:preprocessing} for details.)
+
+Next, we execute a {\MAPREDUCE} job which computes all \emph{transitively} related {\PSGUID}s and {\TID}s; i.e., if
+$x,y$ are related and $y,z$ are related, then $x, z$ are transitively related.
+All related {\PSGUID}s and {\TID}s form a connected component in the undirected graph whose edges are (unordered) pairs
+of {\PSGUID}s which are immediately related, i.e., related due to some WEC record.
+
+During the final stage, namely postprocessing, we map each {\PSGUID} to a unique {\TID}.  (See Sect.~\ref{sect:postprocessing}
+for details.)  
+That is, the postprocessing job outputs
+\KEY={\PSGUID}, \VALUE={\TID} records; the output is then used to upload (and overwrite) the {\PSGUID} map.
+
+\section{Preprocessing}\label{sect:preprocessing}
+
+There are two different preprocessors: WEC and Map.  The latter is executed only if there is an existing {\PSGUID} map.
+In case of WEC, the basic idea is to extract values of fields from WEC input which are related according to the following relation\footnote{Note, the relation
+is symmetric and reflexive, but may not be transitive.}: 
+$x, y$ are related iff there exists a WEC record $r$ such that
+\[
+\begin{array}{l}
+(r.\PSRW = x \lor r.\PSRJ = x \lor r.\PSGUID = x \lor r.\TID_1 = x \lor r.\TID_2 = x) \land\\
+(r.\PSRW = y \lor r.\PSRJ = y \lor r.\PSGUID = y \lor r.\TID_1 = y \lor r.\TID_2 = y)
+\end{array}
+\]
+where $\TID_1$, $\TID_2$ are technically not in $r$ but rather resolved from email and user maps, respectively.
+For example, if a WEC record contains two distinct {\PSGUID}s, say $x, y$ and the record resolves to a single {\TID}, say $z$,
+then $x,y,z$ are related; the output of WEC preprocessing in this example is the set $\{x,y,z\}$.
+
+In case of Map preprocessing, $x, y$ are related iff both $x, y$ are {\PSGUID}s and map to the same {\TID} or
+$x$ (resp., $y$) is a {\PSGUID} and $y$ (resp., $x$) is the corresponding {\TID}.
+For example, suppose we have $(\PSGUID_1, \TID)$, $(\PSGUID_2, \TID)$ in the map.  Then, $\PSGUID_1$, $\PSGUID_2$, $\TID$
+are (pairwise) related.
+
+\subsection{WEC}
+
+Preprocessing of the WEC input is handled by a {\MAPREDUCE} job implemented in \texttt{WECPreprocessor.java}.
+The input to the job is a set of sequence files whose values consist of tab-delimited fields\footnote{The mapping from
+field names to positions can be found in \texttt{wec.xml}.}.
+In addition, \emph{email} and \emph{user} maps\footnote{These maps must be configured on a per client basis.}
+ are specified; they map an email (resp., user) string to a \TID.
+The output of the job is a sequence file whose values are sets of nodes, where each node is either a {\GUID} or a {\TID}.
+The job has zero reducers and an arbitrary number of mappers.
+
+In WEC preprocessing, each row of WEC input is examined in order to extract related fields.  Typically, these fields
+are {\PSRW, \PSRJ}, and {\PSGUID}.  The fields denote related {\GUID}s which may be pairwise distinct.
+In addition, the fields {\EMAIL}, {\CONSUMERGUID}, {\CURRENTURL}, {\GUESTORDER} are examined for the purpose of extracting the identity
+of the user.  If either {\EMAIL} or {\CURRENTURL} contains a nonempty string, then we consult the given email map to lookup
+a {\TID} corresponding to the email.  (Only if {\EMAIL} yields an empty string or the corresponding lookup fails will
+the {\CURRENTURL} be examined.)  Furthermore, if {\CONSUMERGUID} yields a nonempty value, then the given user map
+is consulted to lookup the corresponding {\TID}.  (Note, if {\GUESTORDER} contains the character \texttt{y}, ignoring case, 
+the email map is used instead of the user map.)
+Consequently, the resolved {\TID}s are output in conjunction with the {\GUID}s, i.e., {\PSRW, \PSRJ, \PSGUID}.
+It is indeed possible\footnote{This case seems to be rare but should be investigated further.}
+%\footnote{A consumer may have multiple emails.}
+to obtain two distinct {\TID}s, one corresponding to email, the other corresponding to user id.
+In case of distinct {\TID}s, both are output, and an appropriate counter\footnote{Several data validation counters are
+maintained; see the source code for details.} is incremented.
+
+\section{Map}
+
+Preprocessing of the existing {\PSGUIDMAP} is handled by a {\MAPREDUCE} job implemented in \texttt{PSguidMapPreprocessor.java}.
+The input to the job is a set of comma-delimited values.  Each value is essentially composed of ({\PSGUID}, {\TID}) pairs.
+The output of the job is of the same format as the output of \texttt{WECPreprocessor}, namely it is a
+sequence file whose values comprise sets of nodes.
+The job has an arbitrary number of mappers and a given\footnote{Number of reducers, once configured remains constant
+for all the intermediate jobs; the default is $5$.} number of reducers.
+
+Each mapper simply parses the comma-delimited values and reverses each pair, i.e., \KEY={\TID}, \VALUE={\PSGUID}.
+Each reducer unions all {\PSGUID}s for a given {\TID} and outputs the corresponding set of nodes, i.e., $\{\GUID_1, \ldots, \GUID_n, \TID\}$.
+If any data inconsistencies are encountered, e.g., {\TID}s should be \emph{positive} \texttt{long} values, appropriate counters are incremented.
+
+\section{Connected Components}
+
+After preprocessing we have a bag of sets of related {\GUID}s and their corresponding {\TID}s.  More abstractly, each set denotes a set of
+connected nodes in an undirected graph.  
+The connected components are computed by a {\MAPREDUCE} job implemented in \texttt{ElectionPartition.java}.
+The job is iterative and proceeds in alternating stages, namely \emph{election} and \emph{partition}.
+Roughly speaking, the election job finds all intersecting sets and replaces them by their union; the partition job
+determines pairwise disjoint sets.  The process iterates until all disjoint sets have been computed.
+Initially, each set in the input is marked \texttt{nondisjoint}.  As each partition job determines that a set is disjoint
+it is marked \texttt{disjoint}.  Thus, the connected components are contained amongst the output files of the partition jobs.
+For details, see Sect.~\ref{sect:appendix} and the source code.
+
+\section{Postprocessing}\label{sect:postprocessing}
+
+Postprocessing is handled by a {\MAPREDUCE} job implemented in \texttt{Postprocessor.java}.  The input to the job is a set
+of pairwise disjoint sets of nodes.  The output is the new {\PSGUIDMAP} map.  Thus, each output key, value pair is of the form \KEY={\PSGUID}, \VALUE={\TID}.
+
+Recall, we began with sets of related {\GUID}s and their corresponding {\TID}s.  At this ime, we have computed \emph{all} related {\PSGUID}s
+which from connected components.
+What remains is to output each {\PSGUID} along with the {\TID} it is mapped to.
+Thus, for each disjoint set $S$, and for each {\PSGUID}, $x$, such that $x \in S$, we output \KEY=$x$, \VALUE={\TID} where {\TID} is obtained
+as follows.
+If $S$ contains multiple {\TID}s, we attempt to grab any {\TID} which came\footnote{Each {\TID} is tagged with its source, i.e., WEC or MAP.}
+from WEC.  If no such {\TID} exists, then an arbitrary {\TID} (in $S$) is returned.  In case $S$ contains no tids, we generate a fresh
+one by calling the \emph{sequence} server.  (Sequence server relies on \texttt{Oracle}'s sequences to atomically generate the next sequence number.)
+
+Note, we must generate {\TID}s because jobs such as the \emph{scoring engine} are reliant on {\TID}s. 
+The fact that {\TID}s from WEC have precedence over those from MAP is favorable because typically WEC follows MAP (in time); e.g., MAP may contain
+anonymous {\TID}s obtained from the sequence server which, owing to precedence, would be replaced by {\TID}s which resolve to email or user id.
+
+\section{Discussion}
+
+\paragraph{Open problems.}
+
+\begin{itemize}
+
+\item Multiple users using the same user agent residing on the same physical device are conflated, i.e., treated as a single user.
+
+\item Same {\PSGUID} is shared across distinct user agents, e.g., \texttt{Firefox} and \texttt{MSIE} which results in the case of
+conflated identity, as in the above.  In theory, this case should be extremely rare if it is due to {\PSGUID} collisions.
+However, this cases occurs with a rather high frequency in our current system.  Upon investigation, it was hypothesized that
+some sort of proxy caching is taking place.  Further investigation is needed.
+
+\item A given WEC record may resolve to two distinct {\TID}s.  This seems to be rare but should be investigated.
+\end{itemize}
+
+\section{Appendix}\label{sect:appendix}
+
+\paragraph{Connected Components.}
+
+Suppose we are given an undirected graph $G = (N, E)$, where $N$ is a set of nodes, $E$ is an unordered set of node pairs.
+Below we define connected components of $G$.
+\begin{definition}[connected components]\label{def:cc}
+\rm
+
+Connected components of $G$ are defined inductively:
+\begin{itemize}
+\item if $\{u, v\} \in E$, then $u,v$ are in the same component $C$
+\item if $u \in C$, and there exists $v$ such that $\{u, v\} \in E$, then $v \in C$
+\end{itemize}
+\end{definition}
+The following lemma captures the fact that all connected components are pairwise disjoint.
+\begin{lemma}\label{lemma:cc-disjoint}
+For any two connected components $C_i, C_j$, if $C_i \cap C_j \neq \emptyset$, then $C_i = C_j$.
+\end{lemma}
+
+\begin{example}\label{example:cc}
+\rm
+
+Suppose the graph consists of the following edges: $\{1,2\}$, $\{2,3\}$, $\{3,4\}$, $\{5\}$.
+Then, the connected components are the following disjoint sets: $\{1,2,3,4\}$, $\{5\}$.
+\end{example}
+
+\paragraph{Computing connected components.}
+
+It is not difficult to show that connected components of undirected graphs can be computed using breadth-first search or depth-first search.
+(A single traversal suffices.)
+
+Fig.~\ref{fig:union-find} shows the pseudocode for another algorithm which uses the classical union-find data structure.
+The method \lstinline{MAKE-SET(n)} creates the singleton set $\{n\}$; \lstinline{FIND-SET(u)} returns a set representative for
+the disjoint set containing $u$;  \lstinline{UNION(u, v)} merges the sets containing $u$ and $v$ into a new disjoint set.
+Fig~\ref{fig:union-find-example} shows the algorithm in action for the graph used in Example~\ref{example:cc}.
+
+\begin{figure}
+\begin{lstlisting}[mathescape]
+for each $n \in N$
+  MAKE-SET(n)
+for each $(u, v) \in E$
+  if FIND-SET(u) $\neq$ FIND-SET(v)
+    UNION(u, v)
+\end{lstlisting}
+\caption{Computing connected components using union-find data structure.}
+\label{fig:union-find}
+\end{figure}
+
+\begin{figure}
+\[
+\begin{array}{ll}
+\mbox{Considered Edge} & \mbox{Resulting Disjoint Sets}\\
+\hline\\
+& \{1\}, \{2\}, \{3\}, \{4\}, \{5\}\qquad \mbox{(initial sets)}\\
+\{1,2\} &  \{1, 2\}, \{3\}, \{4\}, \{5\}\\
+\{2,3\} &  \{1, 2, 3\}, \{4\}, \{5\}\\
+\{3,4\} &  \{1, 2, 3, 4\}, \{5\}\\
+\end{array}
+\]
+\caption{Result of executing the algorithm in Fig.~\ref{fig:union-find} on the graph in Example~\ref{example:cc}.}
+\label{fig:union-find-example}
+\end{figure}
+
+We can also compute connected components without the use of union-find data structures.
+Suppose an edge relation is given indirectly in terms of any sets of connected nodes rather than pairs.  E.g.,
+all pairs of edges between the vertices $u,v,w$ can be represented compactly as the set $\{u,v,w\}$.
+This representation inspires the following algorithm in Fig.~\ref{fig:cc-iterative}.
+
+\begin{figure}
+\begin{itemize}
+\item[] repeat
+
+\begin{itemize}
+\item[] choose $S_i, S_j$ such that $S_i \cap S_j \neq \emptyset$:
+\begin{itemize}
+\item[] replace $S_i, S_j$ by $S_i \cup S_j$
+\end{itemize}
+\end{itemize}
+
+\item[] until all $S_i, S_j$ are pairwise disjoint
+\end{itemize}
+\caption{Computing connected components without union-find data structure.}
+\label{fig:cc-iterative}
+\end{figure}
+
+The algorithm in Fig.~\ref{fig:cc-iterative} is correct owing to these observations.  The initial sets of nodes are in fact
+included in the connected components.  That is, for any initial set $S$, there exists some connected component $C$ such that $S \subseteq C$.
+Now, if a pair of sets intersects, i.e., $S_i \cap S_j \neq \emptyset$, then $S_i \subseteq C$ and $S_j \subseteq C$ for some connected component $C$.
+(The fact follows from Lemma~\ref{lemma:cc-disjoint}.)  Therefore, $S_i \cup S_j \subseteq C$; i.e., the union of intersecting sets must be included
+in the connected component.  Since the sets are finite and each iteration computes a potentially larger subset of any given connected component, the
+loop must terminate precisely when all the sets are disjoint.  The disjoint sets correspond to the connected components.
+
+\paragraph{Number of iterations.}
+
+Let $n$ be the cardinality of the largest connected component.  Then, the number of iterations in Fig.~\ref{fig:cc-iterative}
+can be bounded by $\bigO{\log n}$.  Intuitively, each subsequent iteration computes sets whose cardinality is $\leq 2 * k_{i-1} - 1$
+where $k_i$ is the maximum cardinality of any set computed in iteration $i$.
+E.g., given the initial sets $\{a,b,c\}$, $\{c,d\}$, $\{a,e\}$, $\{f\}$, we have $k_0 = 3$.  After the first iteration of the outer loop, the sets
+are: $\{a,b,c,d,e\}$, $\{f\}$ and hence $k_1 = 2 * k_0 -1 = 5$.
+
+\paragraph{Connected components in Hadoop.}
+
+Fig.~\ref{fig:election-partition} has the pseudocode of the algorithm implemented in \texttt{ElectionPartition.java}.
+The algorithm is an adaptation\footnote{The distributed algorithm computes \emph{all} pairs of intersecting sets
+in parallel, essentially replacing the non-deterministic choice in Fig.~\ref{fig:cc-iterative} with a constant number of iterations.} 
+of the classical, (i.e., non-distributed) algorithm in Fig.~\ref{fig:cc-iterative}, whence it has the same
+bound on the number of iterations, namely $\bigO{\log n}$ where $n$ is the length of the longest path in the input graph.
+
+Initially, all input sets are marked \emph{nondisjoint}, and we begin the first iteration of election and partition jobs.
+The output of the election job becomes input for the partition job; the output of the partition job becomes input for the election job.
+Since new disjoint sets are identified in the partition job they must be filtered by subsequent iterations; the election job skips all disjoint sets.
+
+\begin{figure}
+\begin{lstlisting}
+while(true) {
+  run election job;
+  if (optimization && numNondisjointSets <= THRESHOLD) {
+    // compute connected components in memory using BFS
+    run connected components job;
+    break;
+  }
+  run partition job;
+  if (numNondisjointSets == 0) {
+    break;
+  }
+}
+\end{lstlisting}
+\caption{Pseudocode of Election-Partition algorithm.}
+\label{fig:election-partition}
+\end{figure}
+
+\paragraph{Election Mapper.}  
+
+\begin{itemize}
+\item For each nondisjoint set $S$, elect a representative, $\rep(S)$.  In the implementation we use the minimum\footnote{We require that an ordering on set elements is given.} 
+element in the set as the set's representative, i.e., $\rep(S) = \min(S)$.  (Alternatively, we could use the maximum element without affecting
+the algorithm's correctness.)
+
+\item For each set $S$, output the following key,value pairs: $\rep(S) \to S$, $u_1 \to \{rep(S)\}$, \ldots, $u_n \to \{rep(S)\}$, for each $u_i \in S$ such that
+$u_i \neq \rep(S)$.
+\end{itemize}
+
+Note that each element of each set occurs at least once amongst all keys in the output.  
+If a set is disjoint from all other sets, then each of its elements must occur exactly once amongst all keys in the output.
+Otherwise, if $S \cap T \neq \emptyset$, then at least the element $u$ such that $u \in S \cap T$ must occur multiple
+times amongst all keys in the output; i.e., there are key,value pairs: $u \to \rep(S)$ and $u \to \rep(T)$.
+
+\paragraph{Election Reducer.}
+
+The reducer merely unions all sets which are mapped to by the same key.
+
+\paragraph{Partition Mapper.}
+
+\begin{itemize}
+\item For each key,value pair $u \to S$ such that $|S| = 1$, i.e., $S=\{v\}$ for some $v$, output $v \to \{u\}$.
+
+\item For each key,value pair $u \to S$ such that $|S| > 1$, output $u \to S$.
+\end{itemize}
+
+\paragraph{Partition Reducer.}
+
+For each key and the corresponding sequence of sets, $S_1,\ldots,S_n$,
+\begin{itemize}
+\item let $S = S_1 \cup \ldots \cup S_n$
+\item if each set element occurs exactly twice in the sequence, then mark $S$ \emph{disjoint}; otherwise mark $S$ \emph{nondisjoint}
+\item output \VALUE=$S$  (the key is null)
+\end{itemize}
+
+\begin{example}
+\rm
+
+Fig.~\ref{fig:election-partition-example1} shows an example which is also used as a unit test in \texttt{TestElectionPartition.java}.
+(Sets are in square brackets; arrows denote key,value pairs; lack of arrows denote null keys.)
+The example illustrates the output of running election and partition jobs on the given sets using $4$ iterations.
+Indeed, only $3$ iterations are sufficient to compute all connected components.  We used an extra iteration only for illustration---last iteration
+produces no output since the disjoint sets are skipped.
+Note that the singleton disjoint set $\{5\}$ is identified in the first partition job.  The other disjoint set is identified in the third partition
+job.  (No disjoint sets are identified in the second partition.)  Thus, the output of this job is the union of outputs of all partition jobs.
+\end{example}
+
+\begin{example}
+\rm
+
+Fig.~\ref{fig:election-partition-example1} shows an example wherein all input sets are already disjoint.  In this case, one iteration suffices.
+\end{example}
+
+\begin{figure}
+\begin{verbatim}
+Starting Election/Partition with 4 iterations.
+Using the following input: 
+[1, 2]
+[2, 3]
+[3, 4]
+[5]
+
+Results of Election-0
+1-->[1, 2]
+2-->[1, 2, 3]
+3-->[2, 3, 4]
+4-->[3]
+5-->[5]
+
+Results of Partition-0
+[1, 2]
+[1, 2, 3]
+[2, 3, 4]
+[5]
+
+Results of Election-1
+1-->[1, 2, 3]
+2-->[1, 2, 3, 4]
+3-->[1, 2]
+4-->[2]
+
+Results of Partition-1
+[1, 2, 3]
+[1, 2, 3, 4]
+[1, 2, 3]
+
+Results of Election-2
+1-->[1, 2, 3, 4]
+2-->[1]
+3-->[1]
+4-->[1]
+
+Results of Partition-2
+[1, 2, 3, 4]
+
+Results of Election-3
+
+Results of Partition-3
+\end{verbatim}
+\caption{Example of running \texttt{ElectionPartition}.}
+\label{fig:election-partition-example1}
+\end{figure}
+
+\begin{figure}
+\begin{verbatim}
+Starting Election/Partition with 1 iterations.
+Using the following input: 
+[1]
+[2]
+[3]
+
+Results of Election-0
+1-->[1]
+2-->[2]
+3-->[3]
+
+Results of Partition-0
+[1]
+[2]
+[3]
+\end{verbatim}
+\caption{Example of running \texttt{ElectionPartition}.}
+\label{fig:election-partition-example2}
+\end{figure}
+
+
+% The input is always composed of WEC records and optionally, an existing <code>psguid-->tid</code> map.
+%  To make the notion of connected components precise we need to describe how the input is used to specify an undirected graph of
+%  <code>psguids</code>.
+%  The exact relation depends on <code>WEC_FIELDS</code> which specifies what <code>psguid</code> fields are projected
+%  from WEC records, as well as an existing <code>psguid-->tid</code> which specifies related <code>psguids</code>.
+%  Without a loss of generality, suppose <code>WEC_FIELDS="PSRJ, PSRW"</code>. Then, the connected components of <code>psguids</code> are 
+%  the <em>equivalence classes</em> of the <em>transitive closure</em> of
+%  the following relation: <code>R = {(id1, id2) | exists WEC record r such that (r.PSRJ==id1 || r.PSRW==id1) && (r.PSRJ==id2 || PSRW==id2)}</code>.
+%  (If there is an existing <code>psguid --> tid</code> map, then the above relation is updated with a disjunct: 
+%  		"exists <code>tid</code> such that <code>id1-->tid && id2-->tid</code>".)
+ 
+%  We can now formulate how the <code>psguid-->tid</code> is constructed.  Let <code>S</code> be a connected component of
+%  <code>psguids</code>.  Let <code>T</code> be the set of <code>tids</code> which are computed as follows:
+%  T = {tid | exists id in S, exists WEC record r such that (r.PSRJ==id || r.PSRW==id) && (emailMap[r.EMAIL] == tid || userMap[r.USER] == tid)}.
+%  If <code>T</code> is the empty set, then let <code>tid</code> be the result of calling the sequence server.
+%  Otherwise, let <code>tid</code> be the first element in <code>T</code>.
+ 
+%  <code>emailMap</code> maps email found in a WEC record to <code>tid</code>;
+%  <code>userMap</code> maps user is found in a WEC record to <code>tid</code>.
+
+\end{document}
+
+
+%%% Local Variables: 
+%%% mode: latex
+%%% TeX-master: t
+%%% End: 
